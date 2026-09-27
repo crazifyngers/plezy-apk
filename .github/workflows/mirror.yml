@@ -4,6 +4,9 @@ on:
   schedule:
     - cron: "23 */3 * * *"
   workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/mirror.yml
 
 permissions:
   contents: write
@@ -47,6 +50,44 @@ jobs:
           set -euo pipefail
           build_tools=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -n 1)
           mkdir -p dl apks
+          # Prints the SHA-256 of each signer certificate in the APK's v2/v3 signing block.
+          cat > cert_sha256.py <<'EOF'
+          import hashlib, struct, sys
+
+          def lp(b, o):
+              n = struct.unpack_from('<I', b, o)[0]
+              return b[o + 4:o + 4 + n], o + 4 + n
+
+          with open(sys.argv[1], 'rb') as f:
+              f.seek(0, 2)
+              size = f.tell()
+              f.seek(max(0, size - 65557))
+              tail = f.read()
+              cd_off = struct.unpack_from('<I', tail, tail.rfind(b'PK\x05\x06') + 16)[0]
+              f.seek(cd_off - 24)
+              block_size, magic = struct.unpack('<Q16s', f.read(24))
+              assert magic == b'APK Sig Block 42', 'no APK signing block'
+              f.seek(cd_off - block_size - 8)
+              block = f.read(block_size + 8)
+
+          certs = set()
+          p = 8
+          while p < len(block) - 24:
+              n, pair_id = struct.unpack_from('<QI', block, p)
+              value = block[p + 12:p + 8 + n]
+              p += 8 + n
+              if pair_id in (0x7109871a, 0xf05368c0, 0x1b93ad61):  # v2, v3, v3.1
+                  signers, _ = lp(value, 0)
+                  o = 0
+                  while o < len(signers):
+                      signer, o = lp(signers, o)
+                      signed_data, _ = lp(signer, 0)
+                      _, co = lp(signed_data, 0)
+                      cert_seq, _ = lp(signed_data, co)
+                      cert, _ = lp(cert_seq, 0)
+                      certs.add(hashlib.sha256(cert).hexdigest())
+          print('\n'.join(sorted(certs)))
+          EOF
           for abi in $ABIS; do
             tarball="dl/plezy-android-$abi.tar.gz"
             gh release download "$TAG" -R "$UPSTREAM" -p "plezy-android-$abi.tar.gz" -D dl
@@ -56,9 +97,9 @@ jobs:
             tar -xzf "$tarball" -C dl plezy.apk
             apk="apks/plezy-android-$abi.apk"
             mv dl/plezy.apk "$apk"
-            # apksigner also fails here if the APK signature itself is invalid.
-            certs=$("${build_tools}apksigner" verify --print-certs "$apk" \
-              | sed -n 's/^Signer.* certificate SHA-256 digest: //p' | sort -u)
+            # Fails the run if the APK's signature is invalid.
+            "${build_tools}apksigner" verify --print-certs "$apk"
+            certs=$(python3 cert_sha256.py "$apk")
             if [ "$certs" != "$SIGNING_CERT_SHA256" ]; then
               echo "::error::$apk is signed by '$certs', expected $SIGNING_CERT_SHA256"
               exit 1
