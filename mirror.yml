@@ -1,0 +1,92 @@
+name: Mirror Plezy APKs
+
+on:
+  schedule:
+    - cron: "23 */3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  attestations: read
+
+concurrency:
+  group: mirror
+
+env:
+  UPSTREAM: edde746/plezy
+  ABIS: arm64-v8a armeabi-v7a x86_64
+  # SHA-256 of the certificate edde746 signs Plezy APKs with (read from 2.21.0).
+  SIGNING_CERT_SHA256: 903b862cf5e3a0bfbad9b5e049ec3de703f83422bba9c5559a7b019716316e72
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Find upstream release
+        id: upstream
+        run: |
+          set -euo pipefail
+          tag=$(gh release view -R "$UPSTREAM" --json tagName -q .tagName)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "$tag already mirrored"
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download, verify and extract
+        if: steps.upstream.outputs.new == 'true'
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+          build_tools=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -n 1)
+          mkdir -p dl apks
+          for abi in $ABIS; do
+            tarball="dl/plezy-android-$abi.tar.gz"
+            gh release download "$TAG" -R "$UPSTREAM" -p "plezy-android-$abi.tar.gz" -D dl
+            # Proves the tarball came out of upstream's own release workflow.
+            gh attestation verify "$tarball" -R "$UPSTREAM" \
+              --signer-workflow "$UPSTREAM/.github/workflows/build.yml"
+            tar -xzf "$tarball" -C dl plezy.apk
+            apk="apks/plezy-android-$abi.apk"
+            mv dl/plezy.apk "$apk"
+            # apksigner also fails here if the APK signature itself is invalid.
+            certs=$("${build_tools}apksigner" verify --print-certs "$apk" \
+              | sed -n 's/^Signer.* certificate SHA-256 digest: //p' | sort -u)
+            if [ "$certs" != "$SIGNING_CERT_SHA256" ]; then
+              echo "::error::$apk is signed by '$certs', expected $SIGNING_CERT_SHA256"
+              exit 1
+            fi
+            echo "$abi verified"
+          done
+          sha256sum apks/*.apk
+
+      - name: Publish release
+        if: steps.upstream.outputs.new == 'true'
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # A commit per new release counts as repo activity, so GitHub doesn't
+          # disable this schedule after 60 quiet days.
+          echo "$TAG" > LATEST
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add LATEST
+          if ! git diff --cached --quiet; then
+            git commit -m "Mirror $TAG"
+            git push
+          fi
+          {
+            echo "Unmodified APKs from [$UPSTREAM $TAG](https://github.com/$UPSTREAM/releases/tag/$TAG); build attestation and signing certificate verified."
+            echo
+            gh release view "$TAG" -R "$UPSTREAM" --json body -q .body
+          } > notes.md
+          gh release create "$TAG" apks/*.apk -R "$GITHUB_REPOSITORY" \
+            --title "Plezy $TAG" --notes-file notes.md --target "$(git rev-parse HEAD)" --latest
